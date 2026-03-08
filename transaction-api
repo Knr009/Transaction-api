@@ -1,0 +1,144 @@
+const express = require("express");
+const { v4: uuidv4 } = require("uuid");
+
+const app = express();
+app.use(express.json());
+
+// In-memory store (replace with PostgreSQL in production)
+let transactions = [];
+let accounts = {
+  ACC001: { id: "ACC001", owner: "Alice", balance: 5000.00 },
+  ACC002: { id: "ACC002", owner: "Bob",   balance: 3200.00 },
+};
+
+// ─── ACCOUNTS ────────────────────────────────────────────────
+
+// GET all accounts
+app.get("/accounts", (req, res) => {
+  res.json(Object.values(accounts));
+});
+
+// GET account by ID
+app.get("/accounts/:id", (req, res) => {
+  const account = accounts[req.params.id];
+  if (!account) return res.status(404).json({ error: "Account not found" });
+  res.json(account);
+});
+
+// ─── TRANSACTIONS ─────────────────────────────────────────────
+
+// POST - Create a new transaction (authorize + capture)
+app.post("/transactions", (req, res) => {
+  const { fromAccount, toAccount, amount, type } = req.body;
+
+  // Validation
+  if (!fromAccount || !toAccount || !amount || !type) {
+    return res.status(400).json({ error: "Missing required fields: fromAccount, toAccount, amount, type" });
+  }
+  if (!["payment", "refund", "transfer"].includes(type)) {
+    return res.status(400).json({ error: "Invalid type. Must be: payment, refund, transfer" });
+  }
+  if (amount <= 0) {
+    return res.status(400).json({ error: "Amount must be greater than 0" });
+  }
+
+  const sender = accounts[fromAccount];
+  const receiver = accounts[toAccount];
+
+  if (!sender) return res.status(404).json({ error: `Account ${fromAccount} not found` });
+  if (!receiver) return res.status(404).json({ error: `Account ${toAccount} not found` });
+
+  // Idempotency check — prevent duplicate transactions
+  const duplicate = transactions.find(
+    (t) => t.fromAccount === fromAccount && t.toAccount === toAccount &&
+           t.amount === amount && Date.now() - new Date(t.createdAt).getTime() < 5000
+  );
+  if (duplicate) {
+    return res.status(409).json({ error: "Duplicate transaction detected", existing: duplicate });
+  }
+
+  // Insufficient funds check
+  if (sender.balance < amount) {
+    return res.status(422).json({ error: "Insufficient funds", available: sender.balance });
+  }
+
+  // Process transaction
+  sender.balance   = parseFloat((sender.balance - amount).toFixed(2));
+  receiver.balance = parseFloat((receiver.balance + amount).toFixed(2));
+
+  const transaction = {
+    id: uuidv4(),
+    fromAccount,
+    toAccount,
+    amount: parseFloat(amount.toFixed(2)),
+    type,
+    status: "COMPLETED",
+    createdAt: new Date().toISOString(),
+  };
+
+  transactions.push(transaction);
+  res.status(201).json(transaction);
+});
+
+// GET all transactions (with optional filter by account)
+app.get("/transactions", (req, res) => {
+  const { account, type, status } = req.query;
+  let result = transactions;
+
+  if (account) result = result.filter(t => t.fromAccount === account || t.toAccount === account);
+  if (type)    result = result.filter(t => t.type === type);
+  if (status)  result = result.filter(t => t.status === status);
+
+  res.json({ count: result.length, transactions: result });
+});
+
+// GET single transaction by ID
+app.get("/transactions/:id", (req, res) => {
+  const txn = transactions.find(t => t.id === req.params.id);
+  if (!txn) return res.status(404).json({ error: "Transaction not found" });
+  res.json(txn);
+});
+
+// POST - Reverse/refund a transaction
+app.post("/transactions/:id/reverse", (req, res) => {
+  const original = transactions.find(t => t.id === req.params.id);
+  if (!original) return res.status(404).json({ error: "Transaction not found" });
+  if (original.status === "REVERSED") return res.status(409).json({ error: "Transaction already reversed" });
+
+  // Reverse balances
+  accounts[original.fromAccount].balance = parseFloat((accounts[original.fromAccount].balance + original.amount).toFixed(2));
+  accounts[original.toAccount].balance   = parseFloat((accounts[original.toAccount].balance - original.amount).toFixed(2));
+
+  original.status = "REVERSED";
+
+  const reversal = {
+    id: uuidv4(),
+    fromAccount: original.toAccount,
+    toAccount: original.fromAccount,
+    amount: original.amount,
+    type: "refund",
+    status: "COMPLETED",
+    originalTxnId: original.id,
+    createdAt: new Date().toISOString(),
+  };
+
+  transactions.push(reversal);
+  res.status(201).json({ message: "Transaction reversed", reversal });
+});
+
+// GET summary/stats
+app.get("/summary", (req, res) => {
+  const total = transactions.filter(t => t.status === "COMPLETED").reduce((sum, t) => sum + t.amount, 0);
+  res.json({
+    totalTransactions: transactions.length,
+    completedTransactions: transactions.filter(t => t.status === "COMPLETED").length,
+    reversedTransactions: transactions.filter(t => t.status === "REVERSED").length,
+    totalVolumeProcessed: parseFloat(total.toFixed(2)),
+    accounts: Object.values(accounts).map(a => ({ id: a.id, owner: a.owner, balance: a.balance })),
+  });
+});
+
+app.get("/", (req, res) => res.json({ message: "💳 Transaction API is running!", version: "1.0.0" }));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 Transaction API running on http://localhost:${PORT}`));
